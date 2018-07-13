@@ -16,8 +16,6 @@
 
 package org.springframework.cloud.deployer.spi.kubernetes;
 
-import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import io.fabric8.kubernetes.api.model.Container;
 import io.fabric8.kubernetes.api.model.ContainerBuilder;
 import io.fabric8.kubernetes.api.model.PersistentVolumeClaim;
@@ -43,7 +41,6 @@ import io.fabric8.kubernetes.client.KubernetesClient;
 import io.fabric8.kubernetes.client.Watch;
 import io.fabric8.kubernetes.client.Watcher;
 import io.fabric8.kubernetes.client.dsl.FilterWatchListDeletable;
-import okhttp3.Response;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -54,7 +51,6 @@ import org.springframework.cloud.deployer.spi.core.AppDeploymentRequest;
 import org.springframework.cloud.deployer.spi.core.RuntimeEnvironmentInfo;
 import org.springframework.util.StringUtils;
 
-import java.io.IOException;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
@@ -77,11 +73,6 @@ public class KubernetesAppDeployer extends AbstractKubernetesDeployer implements
 
 	private static final String SERVER_PORT_KEY = "server.port";
 
-	private KubernetesHttpClient httpClient;
-	private StatefulSetEndpoint statefulSetEndpoint = new StatefulSetEndpoint();
-
-	private ObjectMapper objectMapper = new ObjectMapper();
-
 	protected final Log logger = LogFactory.getLog(getClass().getName());
 
 	@Autowired
@@ -94,14 +85,6 @@ public class KubernetesAppDeployer extends AbstractKubernetesDeployer implements
 		ContainerFactory containerFactory) {
 		this.properties = properties;
 		this.client = client;
-
-		if (client != null) {
-			httpClient = new KubernetesHttpClient(client);
-
-			String apiVersion = KubernetesHttpClient.getApiVersionForK8sVersionFromCluster(this.httpClient);
-			statefulSetEndpoint = new StatefulSetEndpoint(apiVersion, client.getNamespace());
-		}
-
 		this.containerFactory = containerFactory;
 	}
 
@@ -120,20 +103,14 @@ public class KubernetesAppDeployer extends AbstractKubernetesDeployer implements
 			int externalPort = configureExternalPort(request);
 
 			String indexedProperty = request.getDeploymentProperties().get(INDEXED_PROPERTY_KEY);
-			boolean indexed = (indexedProperty != null) ? Boolean.valueOf(indexedProperty).booleanValue() : false;
+			boolean indexed = (indexedProperty != null) && Boolean.valueOf(indexedProperty);
 
 			if (indexed) {
 				Map<String, String> idMap = createIdMap(appId, request);
 				logger.debug(String.format("Creating Service: %s on %d with", appId, externalPort));
 				createService(appId, request, idMap, externalPort);
 
-				String statefulSetJson = createStatefulSet(appId, request, idMap, externalPort);
-
-				Response response = httpClient.post(statefulSetEndpoint.getEndpoint(), statefulSetJson);
-				if (!response.isSuccessful()) {
-					throw new RuntimeException(String.format(
-						"Create StatefulSet failed. response code %d, message %s" ,response.code(),response.message()));
-				}
+				createStatefulSet(appId, request, idMap, externalPort);
 			}
 			else {
 				Map<String, String> idMap = createIdMap(appId, request);
@@ -203,8 +180,9 @@ public class KubernetesAppDeployer extends AbstractKubernetesDeployer implements
 					if (deplDeleted) {
 						logger.debug(String.format("Deleted Deployment for: %s %b", appIdToDelete, deplDeleted));
 					}
-					Response response = httpClient.delete(statefulSetEndpoint.getEndpoint(), appIdToDelete);
-					Boolean statefulSetDeleted = response.isSuccessful();
+
+					boolean statefulSetDeleted = client.apps().statefulSets().withName(appIdToDelete).delete();
+
 					if (statefulSetDeleted) {
 						logger
 							.debug(String.format("Deleted StatefulSet for: %s %b", appIdToDelete, statefulSetDeleted));
@@ -315,11 +293,9 @@ public class KubernetesAppDeployer extends AbstractKubernetesDeployer implements
 
 	/**
 	 * Create a StatefulSet
-	 * @return as a Json string since the Model does not support 'podManagementPolicy' and we need to set it to
-	 * Parallel.
 	 */
-	protected String createStatefulSet(String appId, AppDeploymentRequest request, Map<String, String> idMap,
-		int externalPort) {
+	protected StatefulSet createStatefulSet(String appId, AppDeploymentRequest request, Map<String, String> idMap,
+											int externalPort) {
 
 		int replicas = getCountFromRequest(request);
 
@@ -335,7 +311,7 @@ public class KubernetesAppDeployer extends AbstractKubernetesDeployer implements
 				.endResources().endSpec().withNewMetadata().withName(appId).withLabels(idMap)
 				.addToLabels(SPRING_MARKER_KEY, SPRING_MARKER_VALUE).endMetadata();
 
-		PodSpec podSpec = createPodSpec(appId, request, Integer.valueOf(externalPort), false);
+		PodSpec podSpec = createPodSpec(appId, request, externalPort, false);
 
 		podSpec.getVolumes().add(new VolumeBuilder().withName("config").withNewEmptyDir().endEmptyDir().build());
 
@@ -345,37 +321,17 @@ public class KubernetesAppDeployer extends AbstractKubernetesDeployer implements
 		podSpec.getInitContainers().add(createInitContainer());
 
 		StatefulSetSpec spec = new StatefulSetSpecBuilder().withNewSelector().addToMatchLabels(idMap)
-			.addToMatchLabels(SPRING_MARKER_KEY, SPRING_MARKER_VALUE).endSelector()
-			.withVolumeClaimTemplates(persistentVolumeClaimBuilder.build()).withServiceName(appId)
-			.withReplicas(replicas).withNewTemplate().withNewMetadata().withLabels(idMap)
-			.addToLabels(SPRING_MARKER_KEY, SPRING_MARKER_VALUE)
-			.endMetadata().withSpec(podSpec).endTemplate().build();
+				.addToMatchLabels(SPRING_MARKER_KEY, SPRING_MARKER_VALUE).endSelector()
+				.withVolumeClaimTemplates(persistentVolumeClaimBuilder.build()).withServiceName(appId)
+				.withPodManagementPolicy("Parallel").withReplicas(replicas).withNewTemplate().withNewMetadata()
+				.withLabels(idMap).addToLabels(SPRING_MARKER_KEY, SPRING_MARKER_VALUE).endMetadata().withSpec(podSpec)
+				.endTemplate().build();
 
 		StatefulSet statefulSet = new StatefulSetBuilder().withNewMetadata().withName(appId).withLabels(idMap)
-				.addToLabels(SPRING_MARKER_KEY, SPRING_MARKER_VALUE).endMetadata()
-				.withApiVersion(statefulSetEndpoint.getVersion()).withSpec(spec).build();
+				.addToLabels(SPRING_MARKER_KEY, SPRING_MARKER_VALUE).endMetadata().withSpec(spec).build();
 
-		Map<String, Object> statefulSetMap = null;
-		try {
-			String ssString = objectMapper.writeValueAsString(statefulSet);
-			statefulSetMap = objectMapper.readValue(ssString, HashMap.class);
-		}
-		catch (JsonProcessingException e) {
-			logger.error("Could not create StatefulSet.", e);
-		}
-		catch (IOException e) {
-			logger.error("Could not create StatefulSet.", e);
-		}
 
-		Map<String, Object> specMap = (Map) statefulSetMap.get("spec");
-		specMap.put("podManagementPolicy", "Parallel");
-
-		try {
-			return objectMapper.writeValueAsString(statefulSetMap);
-		}
-		catch (JsonProcessingException e) {
-			throw new RuntimeException(e);
-		}
+		return client.apps().statefulSets().create(statefulSet);
 	}
 
 	protected void createService(String appId, AppDeploymentRequest request, Map<String, String> idMap,
@@ -482,27 +438,5 @@ public class KubernetesAppDeployer extends AbstractKubernetesDeployer implements
 		return String
 			.format("echo %s=\"$(expr $HOSTNAME | grep -o \"[[:digit:]]*$\")\" >> /config/application" + ".properties",
 				name);
-	}
-
-
-	private static class StatefulSetEndpoint {
-		private String namespace = "default";
-		private String apiVersion = "v1beta1";
-
-		public StatefulSetEndpoint() {
-		}
-
-		public StatefulSetEndpoint(String apiVersion, String namespace) {
-			this.apiVersion = apiVersion;
-			this.namespace = namespace;
-		}
-
-		public String getVersion() {
-			return "apps/" + apiVersion;
-		}
-
-		public String getEndpoint() {
-			return String.format("apis/%s/namespaces/%s/statefulsets", getVersion(), namespace);
-		}
 	}
 }

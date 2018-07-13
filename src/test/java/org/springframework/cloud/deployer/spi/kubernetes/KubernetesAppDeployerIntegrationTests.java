@@ -23,17 +23,26 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
+import io.fabric8.kubernetes.api.model.Container;
 import io.fabric8.kubernetes.api.model.EnvVar;
 import io.fabric8.kubernetes.api.model.HostPathVolumeSource;
+import io.fabric8.kubernetes.api.model.ObjectMeta;
+import io.fabric8.kubernetes.api.model.PersistentVolumeClaim;
+import io.fabric8.kubernetes.api.model.PersistentVolumeClaimSpec;
 import io.fabric8.kubernetes.api.model.Pod;
 import io.fabric8.kubernetes.api.model.PodSpec;
 import io.fabric8.kubernetes.api.model.Service;
 import io.fabric8.kubernetes.api.model.ServiceAccount;
 import io.fabric8.kubernetes.api.model.ServiceAccountBuilder;
+import io.fabric8.kubernetes.api.model.StorageClass;
+import io.fabric8.kubernetes.api.model.StorageClassBuilder;
 import io.fabric8.kubernetes.api.model.Volume;
 import io.fabric8.kubernetes.api.model.VolumeBuilder;
 import io.fabric8.kubernetes.api.model.VolumeMount;
+import io.fabric8.kubernetes.api.model.extensions.StatefulSet;
+import io.fabric8.kubernetes.api.model.extensions.StatefulSetSpec;
 import io.fabric8.kubernetes.client.KubernetesClient;
+import org.assertj.core.api.Assertions;
 import org.hamcrest.BaseMatcher;
 import org.hamcrest.Description;
 import org.hamcrest.Matcher;
@@ -53,6 +62,7 @@ import org.springframework.cloud.deployer.spi.test.Timeout;
 import org.springframework.core.io.Resource;
 import org.springframework.web.client.RestTemplate;
 
+import static org.assertj.core.api.Assertions.entry;
 import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.notNullValue;
 import static org.junit.Assert.assertEquals;
@@ -416,6 +426,145 @@ public class KubernetesAppDeployerIntegrationTests extends AbstractAppDeployerIn
 				Matchers.hasProperty("state", is(unknown))), timeout.maxAttempts, timeout.pause));
 
 		kubernetesClient.serviceAccounts().delete(deploymentServiceAccount);
+	}
+
+	@Test
+	public void createStatefulSet() throws Exception {
+		Map<String, String> props = new HashMap<>();
+		props.put(KubernetesAppDeployer.COUNT_PROPERTY_KEY, "3");
+		props.put(KubernetesAppDeployer.INDEXED_PROPERTY_KEY, "true");
+
+		AppDefinition definition = new AppDefinition(randomName(), null);
+		AppDeploymentRequest appDeploymentRequest = new AppDeploymentRequest(definition, testApplication(), props);
+
+		KubernetesAppDeployer deployer = new KubernetesAppDeployer(new KubernetesDeployerProperties(), kubernetesClient);
+
+		log.info("Deploying {}...", appDeploymentRequest.getDefinition().getName());
+		String deploymentId = deployer.deploy(appDeploymentRequest);
+		Map<String, String> idMap = deployer.createIdMap(deploymentId, appDeploymentRequest);
+
+		Timeout timeout = deploymentTimeout();
+		assertThat(deploymentId, eventually(hasStatusThat(
+				Matchers.hasProperty("state", is(deployed))), timeout.maxAttempts, timeout.pause));
+
+		Map<String, String> selector = Collections.singletonMap(SPRING_APP_KEY, deploymentId);
+
+		StatefulSet statefulSet = kubernetesClient.apps().statefulSets().withLabels(selector).list().getItems().get(0);
+		StatefulSetSpec statefulSetSpec = statefulSet.getSpec();
+
+		Assertions.assertThat(statefulSetSpec.getPodManagementPolicy()).isEqualTo("Parallel");
+		Assertions.assertThat(statefulSetSpec.getReplicas()).isEqualTo(3);
+		Assertions.assertThat(statefulSetSpec.getServiceName()).isEqualTo(deploymentId);
+
+		Assertions.assertThat(statefulSet.getMetadata().getName()).isEqualTo(deploymentId);
+
+		Assertions.assertThat(statefulSetSpec.getSelector().getMatchLabels())
+				.containsAllEntriesOf(deployer.createIdMap(deploymentId, appDeploymentRequest));
+		Assertions.assertThat(statefulSetSpec.getSelector().getMatchLabels())
+				.contains(entry(KubernetesAppDeployer.SPRING_MARKER_KEY, KubernetesAppDeployer.SPRING_MARKER_VALUE));
+
+		Assertions.assertThat(statefulSetSpec.getTemplate().getMetadata().getLabels()).containsAllEntriesOf(idMap);
+		Assertions.assertThat(statefulSetSpec.getTemplate().getMetadata().getLabels())
+				.contains(entry(KubernetesAppDeployer.SPRING_MARKER_KEY, KubernetesAppDeployer.SPRING_MARKER_VALUE));
+
+		Container container = statefulSetSpec.getTemplate().getSpec().getContainers().get(0);
+
+		Assertions.assertThat(container.getName()).isEqualTo(deploymentId);
+		Assertions.assertThat(container.getPorts().get(0).getContainerPort()).isEqualTo(8080);
+		Assertions.assertThat(container.getImage()).isEqualTo(testApplication().getURI().getSchemeSpecificPart());
+
+		PersistentVolumeClaim pvc = statefulSetSpec.getVolumeClaimTemplates().get(0);
+		Assertions.assertThat(pvc.getMetadata().getName()).isEqualTo(deploymentId);
+
+		PersistentVolumeClaimSpec pvcSpec = pvc.getSpec();
+		Assertions.assertThat(pvcSpec.getAccessModes()).containsOnly("ReadWriteOnce");
+		Assertions.assertThat(pvcSpec.getStorageClassName()).isNull();
+		Assertions.assertThat(pvcSpec.getResources().getLimits().get("storage").getAmount()).isEqualTo("10Mi");
+		Assertions.assertThat(pvcSpec.getResources().getRequests().get("storage").getAmount()).isEqualTo("10Mi");
+
+		log.info("Undeploying {}...", deploymentId);
+		timeout = undeploymentTimeout();
+		appDeployer.undeploy(deploymentId);
+		assertThat(deploymentId, eventually(hasStatusThat(
+				Matchers.hasProperty("state", is(unknown))), timeout.maxAttempts, timeout.pause));
+	}
+
+	@Test
+	public void createStatefulSetWithOverridingRequest() throws Exception {
+		String storageClassName = randomName();
+
+		Map<String, String> props = new HashMap<>();
+		props.put(KubernetesAppDeployer.COUNT_PROPERTY_KEY, "3");
+		props.put(KubernetesAppDeployer.INDEXED_PROPERTY_KEY, "true");
+		props.put("spring.cloud.deployer.kubernetes.statefulSet.volumeClaimTemplate.storageClassName", storageClassName);
+		props.put("spring.cloud.deployer.kubernetes.statefulSet.volumeClaimTemplate.storage", "1g");
+
+		ObjectMeta metadata = new ObjectMeta();
+		metadata.setName(storageClassName);
+
+		StorageClass storageClass = new StorageClassBuilder()
+				.withApiVersion("storage.k8s.io/v1")
+				.withKind("StorageClass")
+				.withProvisioner("kubernetes.io/gce-pd")
+				.withMetadata(metadata)
+				.build();
+
+		kubernetesClient.storageClasses().create(storageClass);
+
+		AppDefinition definition = new AppDefinition(randomName(), null);
+		AppDeploymentRequest appDeploymentRequest = new AppDeploymentRequest(definition, testApplication(), props);
+
+		KubernetesAppDeployer deployer = new KubernetesAppDeployer(new KubernetesDeployerProperties(), kubernetesClient);
+
+		log.info("Deploying {}...", appDeploymentRequest.getDefinition().getName());
+		String deploymentId = deployer.deploy(appDeploymentRequest);
+		Map<String, String> idMap = deployer.createIdMap(deploymentId, appDeploymentRequest);
+
+		Timeout timeout = deploymentTimeout();
+		assertThat(deploymentId, eventually(hasStatusThat(
+				Matchers.hasProperty("state", is(deployed))), timeout.maxAttempts, timeout.pause));
+
+		Map<String, String> selector = Collections.singletonMap(SPRING_APP_KEY, deploymentId);
+
+		StatefulSet statefulSet = kubernetesClient.apps().statefulSets().withLabels(selector).list().getItems().get(0);
+		StatefulSetSpec statefulSetSpec = statefulSet.getSpec();
+
+		Assertions.assertThat(statefulSetSpec.getPodManagementPolicy()).isEqualTo("Parallel");
+		Assertions.assertThat(statefulSetSpec.getReplicas()).isEqualTo(3);
+		Assertions.assertThat(statefulSetSpec.getServiceName()).isEqualTo(deploymentId);
+		Assertions.assertThat(statefulSet.getMetadata().getName()).isEqualTo(deploymentId);
+
+		Assertions.assertThat(statefulSetSpec.getSelector().getMatchLabels())
+				.containsAllEntriesOf(deployer.createIdMap(deploymentId, appDeploymentRequest));
+		Assertions.assertThat(statefulSetSpec.getSelector().getMatchLabels())
+				.contains(entry(KubernetesAppDeployer.SPRING_MARKER_KEY, KubernetesAppDeployer.SPRING_MARKER_VALUE));
+
+		Assertions.assertThat(statefulSetSpec.getTemplate().getMetadata().getLabels()).containsAllEntriesOf(idMap);
+		Assertions.assertThat(statefulSetSpec.getTemplate().getMetadata().getLabels())
+				.contains(entry(KubernetesAppDeployer.SPRING_MARKER_KEY, KubernetesAppDeployer.SPRING_MARKER_VALUE));
+
+		Container container = statefulSetSpec.getTemplate().getSpec().getContainers().get(0);
+
+		Assertions.assertThat(container.getName()).isEqualTo(deploymentId);
+		Assertions.assertThat(container.getPorts().get(0).getContainerPort()).isEqualTo(8080);
+		Assertions.assertThat(container.getImage()).isEqualTo(testApplication().getURI().getSchemeSpecificPart());
+
+		PersistentVolumeClaim pvc = statefulSetSpec.getVolumeClaimTemplates().get(0);
+		Assertions.assertThat(pvc.getMetadata().getName()).isEqualTo(deploymentId);
+
+		PersistentVolumeClaimSpec pvcSpec = pvc.getSpec();
+		Assertions.assertThat(pvcSpec.getAccessModes()).containsOnly("ReadWriteOnce");
+		Assertions.assertThat(pvcSpec.getStorageClassName()).isEqualTo(storageClassName);
+		Assertions.assertThat(pvcSpec.getResources().getLimits().get("storage").getAmount()).isEqualTo("1Gi");
+		Assertions.assertThat(pvcSpec.getResources().getRequests().get("storage").getAmount()).isEqualTo("1Gi");
+
+		log.info("Undeploying {}...", deploymentId);
+		timeout = undeploymentTimeout();
+		appDeployer.undeploy(deploymentId);
+		assertThat(deploymentId, eventually(hasStatusThat(
+				Matchers.hasProperty("state", is(unknown))), timeout.maxAttempts, timeout.pause));
+
+		kubernetesClient.storageClasses().delete(storageClass);
 	}
 
 	@Override
